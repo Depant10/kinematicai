@@ -1,5 +1,7 @@
 # KinematicAI — Gait-Based Injury Risk from Broadcast Football Video
 
+> ⚠️ **Work in Progress** — core pipeline functional, dashboard and validation layer under active development.
+
 > Detects biomechanical asymmetry in athletes' gait using only standard broadcast video — no wearables, no lab setup, no cooperation from the subject.
 
 ---
