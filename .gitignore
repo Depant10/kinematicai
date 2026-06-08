@@ -1,0 +1,14 @@
+.env
+*.env
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+output/
+soccernet_loaded/
+soccernet_processed/
+videos/
+*.mp4
+*.avi
+*.mov
+*.log

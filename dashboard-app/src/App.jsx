@@ -1,0 +1,772 @@
+/* global React */
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { REAL_MULTI_DATA, AGGREGATE_DATA } from './data';
+import { SOCCERNET_DATA } from './soccernet_data';
+import './index.css';
+
+// ───── data generators ─────────────────────────────────────────────
+function seeded(seed) {
+  let s = seed;
+  return () => {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+
+// Generate the baseline gait curve: low + slight upward drift, smooth
+function genBaseline(pData) { return pData.baseline; }
+
+// Generate live curve: tracks baseline early, then diverges upward sharply
+function genLive(pData, currentMin) { return pData.live.filter(p => p.x <= currentMin); }
+
+function genSparkline(seed, trend = 0, n = 30) {
+  const r = seeded(seed);
+  const pts = [];
+  let v = 50;
+  for (let i = 0; i < n; i++) {
+    v += (r() - 0.5) * 6 + trend * 0.4;
+    v = Math.max(5, Math.min(95, v));
+    pts.push(v);
+  }
+  return pts;
+}
+
+// ───── primitives ─────────────────────────────────────────────────
+function Sparkline({ data, color = '#22d3ee', height = 36, thresh }) {
+  const w = 200;
+  const min = Math.min(...data) - 2;
+  const max = Math.max(...data) + 2;
+  const range = max - min || 1;
+  const path = data
+    .map((v, i) => {
+      const x = (i / (data.length - 1)) * w;
+      const y = height - ((v - min) / range) * height;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+  const areaPath = `${path} L${w},${height} L0,${height} Z`;
+  return (
+    <svg className="spark" viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id={`sg-${color.slice(1)}`} x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.35" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {thresh != null && (
+        <line
+          x1="0" x2={w}
+          y1={height - ((thresh - min) / range) * height}
+          y2={height - ((thresh - min) / range) * height}
+          stroke="#3a4452" strokeDasharray="2,2" strokeWidth="1"
+        />
+      )}
+      <path d={areaPath} fill={`url(#sg-${color.slice(1)})`} />
+      <path d={path} fill="none" stroke={color} strokeWidth="1.2" />
+      <circle
+        cx={w}
+        cy={height - ((data[data.length - 1] - min) / range) * height}
+        r="2" fill={color}
+      />
+    </svg>
+  );
+}
+
+// ───── main chart ─────────────────────────────────────────────────
+function TemporalRiskChart({ matchMinute, baseline, live, realStats }) {
+  const W = 1000, H = 460;
+  const pad = { l: 56, r: 24, t: 56, b: 40 };
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+  const xMin = 0, xMax = realStats ? realStats.matchMinute : 90;
+  const yMin = 0, yMax = 100;
+  const threshold = 70;
+
+  const sx = x => pad.l + ((x - xMin) / (xMax - xMin)) * innerW;
+  const sy = y => pad.t + (1 - (y - yMin) / (yMax - yMin)) * innerH;
+
+  const lineToPath = pts =>
+    pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+
+  const areaPath = pts => {
+    if (!pts.length) return '';
+    const top = lineToPath(pts);
+    const last = pts[pts.length - 1];
+    return `${top} L${sx(last.x).toFixed(1)},${sy(yMin).toFixed(1)} L${sx(pts[0].x).toFixed(1)},${sy(yMin).toFixed(1)} Z`;
+  };
+
+  const xTicks = [0, 15, 30, 45, 60, 75, 90, 105];
+  const yTicks = [0, 25, 50, 75, 100];
+
+  const nowX = sx(matchMinute);
+  const nowPt = live[live.length - 1];
+
+  return (
+    <div className="chart-wrap">
+      <div className="chart-legend">
+        <span className="legend-item"><span className="legend-swatch swatch-baseline"/>HEALTHY BASELINE</span>
+        <span className="legend-item"><span className="legend-swatch swatch-live"/>LIVE GAIT DEGRADATION</span>
+        <span className="legend-item"><span style={{width:10, height:0, borderTop:'1px dashed #ef4444'}}/>ACTUARIAL THRESHOLD</span>
+      </div>
+      <div className="chart-overlay">
+        <span style={{color:'#5a6675', letterSpacing:'0.12em'}}>WINDOW · {realStats.matchMinute}:00 ANALYZED</span>
+        <span style={{color:'#98a4b3', fontVariantNumeric:'tabular-nums'}}>MIN {String(Math.floor(matchMinute)).padStart(2,'0')}:{String(Math.floor((matchMinute%1)*60)).padStart(2,'0')}</span>
+      </div>
+      <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="g-base" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#10b981" stopOpacity="0.18" />
+            <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="g-live" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#ef4444" stopOpacity="0.4" />
+            <stop offset="100%" stopColor="#ef4444" stopOpacity="0" />
+          </linearGradient>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#161d27" strokeWidth="0.5"/>
+          </pattern>
+        </defs>
+
+        {/* grid */}
+        <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="url(#grid)" opacity="0.6"/>
+
+        {/* halftime band */}
+        <rect x={sx(45)} y={pad.t} width={sx(46)-sx(45)} height={innerH} fill="#22d3ee" opacity="0.04"/>
+        <line x1={sx(45)} x2={sx(45)} y1={pad.t} y2={pad.t+innerH} stroke="#243042" strokeDasharray="3,3" strokeWidth="1"/>
+        <text x={sx(45)+4} y={pad.t+12} fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono" letterSpacing="0.1em">HT</text>
+
+        {/* baseline area + line */}
+        <path d={areaPath(baseline)} fill="url(#g-base)" />
+        <path d={lineToPath(baseline)} fill="none" stroke="#10b981" strokeWidth="1.2" strokeDasharray="3,2" opacity="0.85"/>
+
+        {/* live area + line (only up to current minute) */}
+        <path d={areaPath(live)} fill="url(#g-live)" />
+        <path d={lineToPath(live)} fill="none" stroke="#ef4444" strokeWidth="2"/>
+
+        {/* threshold line */}
+        <line x1={pad.l} x2={pad.l+innerW} y1={sy(threshold)} y2={sy(threshold)} stroke="#ef4444" strokeDasharray="4,4" strokeWidth="1" opacity="0.8"/>
+        <rect x={pad.l+innerW-130} y={sy(threshold)-14} width="126" height="16" fill="#1a0508" stroke="#ef4444" strokeOpacity="0.5"/>
+        <text x={pad.l+innerW-67} y={sy(threshold)-2} textAnchor="middle" fill="#ef4444" fontSize="9" fontFamily="IBM Plex Mono" letterSpacing="0.12em">ACTUARIAL THRESHOLD · 70</text>
+
+        {/* now marker */}
+        <line x1={nowX} x2={nowX} y1={pad.t} y2={pad.t+innerH} stroke="#ef4444" strokeWidth="1" opacity="0.6"/>
+        {nowPt && (
+          <>
+            <circle cx={nowX} cy={sy(nowPt.y)} r="6" fill="#ef4444" opacity="0.2"/>
+            <circle cx={nowX} cy={sy(nowPt.y)} r="3" fill="#ef4444"/>
+          </>
+        )}
+
+        {/* axes */}
+        <line x1={pad.l} x2={pad.l+innerW} y1={pad.t+innerH} y2={pad.t+innerH} stroke="#243042"/>
+        <line x1={pad.l} x2={pad.l} y1={pad.t} y2={pad.t+innerH} stroke="#243042"/>
+
+        {xTicks.map(t => (
+          <g key={t}>
+            <line x1={sx(t)} x2={sx(t)} y1={pad.t+innerH} y2={pad.t+innerH+4} stroke="#243042"/>
+            <text x={sx(t)} y={pad.t+innerH+18} textAnchor="middle" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{t}'</text>
+          </g>
+        ))}
+        <text x={pad.l+innerW/2} y={H-6} textAnchor="middle" fill="#5a6675" fontSize="9" fontFamily="IBM Plex Mono" letterSpacing="0.18em">MATCH MINUTE</text>
+
+        {yTicks.map(t => (
+          <g key={t}>
+            <line x1={pad.l-4} x2={pad.l} y1={sy(t)} y2={sy(t)} stroke="#243042"/>
+            <text x={pad.l-8} y={sy(t)+3} textAnchor="end" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{t}</text>
+          </g>
+        ))}
+        <text x={14} y={pad.t+innerH/2} textAnchor="middle" fill="#5a6675" fontSize="9" fontFamily="IBM Plex Mono" letterSpacing="0.18em" transform={`rotate(-90 14 ${pad.t+innerH/2})`}>GAIT DEGRADATION SCORE</text>
+
+        {/* annotation */}
+        <line x1={sx(realStats.divergeMin)} x2={sx(realStats.divergeMin)} y1={sy(28)} y2={sy(48)} stroke="#f59e0b" strokeWidth="1" opacity="0.7"/>
+        <circle cx={sx(realStats.divergeMin)} cy={sy(28)} r="3" fill="none" stroke="#f59e0b"/>
+        <text x={sx(55)+8} y={sy(26)} fill="#f59e0b" fontSize="10" fontFamily="IBM Plex Mono" letterSpacing="0.08em">DIVERGENCE ONSET · {realStats.divergeMin}'</text>
+      </svg>
+
+      {nowPt && (
+        <div className="now-pill" style={{ left: `${(nowX/W)*100}%`, top: `${(sy(nowPt.y)/H)*100}%` }}>
+          NOW · {nowPt.y.toFixed(1)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ───── tele card ──────────────────────────────────────────────────
+function TeleCard({ name, sub, value, unit, status, trend, spark, baseline, threshold }) {
+  const lvlClass = status === 'crit' ? 'crit' : status === 'warn' ? 'warn' : 'ok';
+  const trendUp = trend > 0;
+  return (
+    <div className="tele-card">
+      <div className="tele-h">
+        <div className="tele-name">{name}<span className="sub">{sub}</span></div>
+        <span className={`tele-status ${lvlClass}`}>
+          <span className={`dot ${status === 'crit' ? 'crimson' : status === 'warn' ? 'amber' : ''}`} style={{width:5,height:5}}/>
+          {status === 'crit' ? 'CRIT' : status === 'warn' ? 'WARN' : 'OK'}
+        </span>
+      </div>
+      <div className="tele-row">
+        <span className={`tele-val ${lvlClass}`}>{value}</span>
+        <span className="tele-unit">{unit}</span>
+        <span className={`tele-trend ${trendUp ? 'up' : 'down'}`}>
+          {trendUp ? '▲' : '▼'} {Math.abs(trend).toFixed(1)}%
+        </span>
+      </div>
+      <Sparkline data={spark} color={status === 'crit' ? '#ef4444' : status === 'warn' ? '#f59e0b' : '#10b981'} thresh={threshold}/>
+      <div className="tele-foot">
+        <span>BASE {baseline}</span>
+        <span>σ 15:00</span>
+      </div>
+    </div>
+  );
+}
+
+// ───── render ─────────────────────────────────────────────────────
+
+
+function BucketDistributionChart({ aggregateData }) {
+  const [metric, setMetric] = useState('knee_asymmetry');
+  const metrics = aggregateData.metrics;
+  const buckets = aggregateData.buckets;
+  const mData = metrics[metric];
+
+  const W = 1000, H = 460;
+  const pad = { l: 56, r: 24, t: 56, b: 40 };
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+
+  let yMax = 0;
+  buckets.forEach(b => {
+    if (mData[b]) {
+        const mx = mData[b].p75 + mData[b].std * 1.5;
+        if (mx > yMax) yMax = mx;
+    }
+  });
+  if (yMax === 0) yMax = 1;
+  const yMin = 0;
+
+  const sx = i => pad.l + (i + 0.5) * (innerW / buckets.length);
+  const sy = y => pad.t + (1 - (Math.min(yMax, Math.max(yMin, y)) - yMin) / (yMax - yMin)) * innerH;
+
+  const yTicks = [0, yMax * 0.25, yMax * 0.5, yMax * 0.75, yMax];
+  
+  return (
+    <div className="chart-wrap">
+      <div className="chart-legend" style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+        <span className="legend-item"><span className="legend-swatch swatch-live"/>MEDIAN & IQR (BOX)</span>
+        <span className="legend-item"><span style={{width:10, height:0, borderTop:'1px solid #22d3ee'}}/>WHISKERS (±1 STD)</span>
+        <span className="legend-item" style={{marginLeft: 'auto'}}>METRIC:</span>
+        <select value={metric} onChange={e => setMetric(e.target.value)} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '2px 4px'}}>
+          <option value="knee_asymmetry">Knee Asymmetry</option>
+          <option value="hip_asymmetry">Hip Asymmetry</option>
+          <option value="hip_drop">Hip Drop</option>
+          <option value="valgus_asymmetry">Valgus Asymmetry</option>
+        </select>
+      </div>
+      <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#161d27" strokeWidth="0.5"/>
+          </pattern>
+        </defs>
+        <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="url(#grid)" opacity="0.6"/>
+
+        <line x1={pad.l} x2={pad.l+innerW} y1={pad.t+innerH} y2={pad.t+innerH} stroke="#243042"/>
+        <line x1={pad.l} x2={pad.l} y1={pad.t} y2={pad.t+innerH} stroke="#243042"/>
+
+        {yTicks.map((t, i) => (
+          <g key={i}>
+            <line x1={pad.l-4} x2={pad.l} y1={sy(t)} y2={sy(t)} stroke="#243042"/>
+            <text x={pad.l-8} y={sy(t)+3} textAnchor="end" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{t.toFixed(2)}</text>
+          </g>
+        ))}
+
+        {buckets.map((b, i) => {
+          const stats = mData[b];
+          if (!stats || stats.n === 0) return (
+             <text key={b} x={sx(i)} y={pad.t+innerH+18} textAnchor="middle" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{b}'</text>
+          );
+          
+          const boxW = 30;
+          return (
+            <g key={b}>
+              <line x1={sx(i)} x2={sx(i)} y1={sy(Math.max(0, stats.mean - stats.std))} y2={sy(stats.mean + stats.std)} stroke="#22d3ee" strokeWidth="1" opacity="0.6"/>
+              <line x1={sx(i)-boxW/4} x2={sx(i)+boxW/4} y1={sy(Math.max(0, stats.mean - stats.std))} y2={sy(Math.max(0, stats.mean - stats.std))} stroke="#22d3ee" strokeWidth="1" opacity="0.6"/>
+              <line x1={sx(i)-boxW/4} x2={sx(i)+boxW/4} y1={sy(stats.mean + stats.std)} y2={sy(stats.mean + stats.std)} stroke="#22d3ee" strokeWidth="1" opacity="0.6"/>
+              
+              <rect x={sx(i)-boxW/2} y={sy(stats.p75)} width={boxW} height={Math.max(1, sy(stats.p25) - sy(stats.p75))} fill="#10b981" fillOpacity="0.2" stroke="#10b981" strokeWidth="1"/>
+              
+              <line x1={sx(i)-boxW/2} x2={sx(i)+boxW/2} y1={sy(stats.median)} y2={sy(stats.median)} stroke="#ef4444" strokeWidth="2"/>
+              
+              <text x={sx(i)} y={pad.t+innerH+18} textAnchor="middle" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{b}'</text>
+              <text x={sx(i)} y={pad.t+innerH+32} textAnchor="middle" fill="#3a4452" fontSize="9" fontFamily="IBM Plex Mono">n={stats.n}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+
+function SoccerNetTimelineChart({ playerData }) {
+  const [metric, setMetric] = useState('knee_asymmetry');
+  
+  const mData = playerData?.metrics?.[metric]?.buckets || {};
+  const buckets = Object.keys(mData);
+  
+  const W = 1000, H = 460;
+  const pad = { l: 56, r: 24, t: 56, b: 40 };
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+
+  let yMax = 0;
+  buckets.forEach(b => {
+    if (mData[b] && mData[b].n > 0) {
+        const mx = mData[b].mean + mData[b].std * 1.5;
+        if (mx > yMax) yMax = mx;
+    }
+  });
+  if (yMax === 0) yMax = 1;
+  const yMin = 0;
+
+  const sx = i => pad.l + (i + 0.5) * (innerW / buckets.length);
+  const sy = y => pad.t + (1 - (Math.min(yMax, Math.max(yMin, y)) - yMin) / (yMax - yMin)) * innerH;
+
+  const yTicks = [0, yMax * 0.25, yMax * 0.5, yMax * 0.75, yMax];
+  
+  // Create line path
+  const validIndices = buckets.map((b, i) => mData[b] && mData[b].n > 0 ? i : -1).filter(i => i !== -1);
+  let dPath = "";
+  validIndices.forEach((vi, idx) => {
+    const b = buckets[vi];
+    const x = sx(vi);
+    const y = sy(mData[b].mean);
+    dPath += idx === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
+  });
+
+  return (
+    <div className="chart-wrap">
+      <div className="chart-legend" style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+        <span className="legend-item"><span className="legend-swatch swatch-live"/>BUCKET MEAN & ±1 STD</span>
+        <span className="legend-item" style={{marginLeft: 'auto'}}>METRIC:</span>
+        <select value={metric} onChange={e => setMetric(e.target.value)} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '2px 4px'}}>
+          <option value="knee_asymmetry">Knee Asymmetry</option>
+          <option value="hip_asymmetry">Hip Asymmetry</option>
+          <option value="hip_drop">Hip Drop</option>
+          <option value="valgus_asymmetry">Valgus Asymmetry</option>
+        </select>
+      </div>
+      <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#161d27" strokeWidth="0.5"/>
+          </pattern>
+        </defs>
+        <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="url(#grid)" opacity="0.6"/>
+
+        <line x1={pad.l} x2={pad.l+innerW} y1={pad.t+innerH} y2={pad.t+innerH} stroke="#243042"/>
+        <line x1={pad.l} x2={pad.l} y1={pad.t} y2={pad.t+innerH} stroke="#243042"/>
+
+        {yTicks.map((t, i) => (
+          <g key={i}>
+            <line x1={pad.l-4} x2={pad.l} y1={sy(t)} y2={sy(t)} stroke="#243042"/>
+            <text x={pad.l-8} y={sy(t)+3} textAnchor="end" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{t.toFixed(2)}</text>
+          </g>
+        ))}
+        
+        <path d={dPath} fill="none" stroke="#34d399" strokeWidth="2" strokeDasharray="4 4" />
+
+        {buckets.map((b, i) => {
+          const stats = mData[b];
+          if (!stats || stats.n === 0) return (
+             <text key={b} x={sx(i)} y={pad.t+innerH+18} textAnchor="middle" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{b}'</text>
+          );
+          
+          return (
+            <g key={b}>
+              <line x1={sx(i)} x2={sx(i)} y1={sy(Math.max(0, stats.mean - stats.std))} y2={sy(stats.mean + stats.std)} stroke="#22d3ee" strokeWidth="1"/>
+              <line x1={sx(i)-10} x2={sx(i)+10} y1={sy(Math.max(0, stats.mean - stats.std))} y2={sy(Math.max(0, stats.mean - stats.std))} stroke="#22d3ee" strokeWidth="1"/>
+              <line x1={sx(i)-10} x2={sx(i)+10} y1={sy(stats.mean + stats.std)} y2={sy(stats.mean + stats.std)} stroke="#22d3ee" strokeWidth="1"/>
+              
+              <circle cx={sx(i)} cy={sy(stats.mean)} r={4} fill="#34d399"/>
+              
+              <text x={sx(i)} y={pad.t+innerH+18} textAnchor="middle" fill="#5a6675" fontSize="10" fontFamily="IBM Plex Mono">{b}'</text>
+              <text x={sx(i)} y={pad.t+innerH+32} textAnchor="middle" fill="#3a4452" fontSize="9" fontFamily="IBM Plex Mono">n={stats.n}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function App() {
+  const [viewMode, setViewMode] = useState('summary');
+  const [selectedMatch, setSelectedMatch] = useState('match_001');
+  const [soccerNetMatch, setSoccerNetMatch] = useState(Object.keys(SOCCERNET_DATA)[0] || '');
+  const [soccerNetTrack, setSoccerNetTrack] = useState(SOCCERNET_DATA[Object.keys(SOCCERNET_DATA)[0]] ? Object.keys(SOCCERNET_DATA[Object.keys(SOCCERNET_DATA)[0]])[0] : '');
+  const [selectedPlayer, setSelectedPlayer] = useState('barca_player_1');
+  const pData = REAL_MULTI_DATA[selectedPlayer] || REAL_MULTI_DATA[Object.keys(REAL_MULTI_DATA)[0]];
+  const REAL_STATS = pData.stats;
+
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 900);
+    return () => clearInterval(id);
+  }, []);
+
+  // match minute drifts forward slowly
+  const matchMinute = REAL_STATS.matchMinute;
+  const baseline = useMemo(() => genBaseline(pData), [pData]);
+  const live = useMemo(() => genLive(pData, Math.floor(matchMinute)), [pData, Math.floor(matchMinute)]);
+
+  // live confidence wobbles around 0.88
+  const confidence = REAL_STATS.confidence;
+  const latency = 12 + Math.round(Math.sin(tick) * 1.5);
+  const fps = 64;
+  const riskIdx = REAL_STATS.riskIdx;
+
+  // sparklines
+  const sparkKnee = pData.sparkKnee;
+  const sparkHip = pData.sparkHip;
+  const sparkValgus = pData.sparkValgus;
+
+  // log
+  const logs = [
+    { t: '78:42', lvl: 'crit', msg: <>Knee asymmetry Δ exceeds <b>2.4σ</b> for 45s window — flagging</> },
+    { t: '78:18', lvl: 'warn', msg: <>Hip drop trending <b>+12.4%</b> vs personal baseline</> },
+    { t: '77:55', lvl: 'info', msg: <>BoT-SORT re-acquired track ID <b>#A·11</b> after occlusion</> },
+    { t: '77:31', lvl: 'warn', msg: <>Valgus load proxy crossed P75 (rolling 15:00)</> },
+    { t: '76:08', lvl: 'info', msg: <>Field registration recalibrated · K Δ <b>0.012</b></> },
+    { t: '75:42', lvl: 'ok', msg: <>Pose confidence stable @ <b>0.881</b> · 3-frame median</> },
+    { t: '74:11', lvl: 'crit', msg: <>Risk index crossed amber→red @ <b>71.2</b></> },
+    { t: '73:30', lvl: 'info', msg: <>Tactical context: formation <b>4-3-3 → 4-2-3-1</b></> },
+    { t: '71:54', lvl: 'warn', msg: <>Stride length variance up <b>0.8σ</b> · L leg dominant</> },
+    { t: '70:20', lvl: 'info', msg: <>FiLM tactical conditioning vector updated</> },
+  ];
+
+  return (
+    <div className="app">
+      {/* TOP BAR */}
+      <div className="topbar">
+        <div className="brand">
+          <div className="brand-mark">K</div>
+          KinematicAI
+          <span className="brand-sub">BIOMECHANICAL TELEMETRY · v3.2.1-rc</span>
+        </div>
+        <div className="topbar-center">
+          <span className="tab active">ANALYSIS</span>
+          <span className="tab">PLAYERS</span>
+          <span className="tab">MATCHES</span>
+          <span className="tab">MODEL</span>
+          <span className="tab">EXPORTS</span>
+        </div>
+        <div className="topbar-right">
+          <span className="kvs">
+            <span>NODE <b>g5.2xl·a10g</b></span>
+            <span>DATA <b>{REAL_STATS.dataPoints} pts</b></span>
+            <span>UTC <b>{new Date().toISOString().slice(11,19)}</b></span>
+          </span>
+          <span className="live-pill" style={{background: '#1e293b', color: '#94a3b8', border: '1px solid #334155'}}>
+            <span className="dot" style={{background: '#64748b', boxShadow: 'none'}}/>REPLAY · 2017 EL CLÁSICO
+          </span>
+        </div>
+      </div>
+
+      {/* MAIN GRID */}
+      <div className="grid">
+        {/* SELECTOR / PLAYER CARD */}
+        <div className="cell-player panel">
+          <div className="panel-h">
+            <h3>ANALYSIS CONTEXT</h3>
+            <span className="h-meta">{viewMode === 'summary' ? 'AGGREGATE MODE' : 'SINGLE CLIP'}</span>
+          </div>
+          <div className="panel-b" style={{display: 'flex', flexDirection: 'column', gap: '16px'}}>
+            
+            <div style={{display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '8px'}}>
+              <div style={{display: 'flex', gap: '8px'}}>
+                <button 
+                  onClick={() => setViewMode('summary')}
+                  style={{flex: 1, padding: '6px', background: viewMode === 'summary' ? '#10b981' : '#111118', color: viewMode === 'summary' ? '#fff' : '#5a6675', border: '1px solid #1e1e2e', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '11px'}}
+                >
+                  MATCH SUMMARY
+                </button>
+                <button 
+                  onClick={() => setViewMode('inspector')}
+                  style={{flex: 1, padding: '6px', background: viewMode === 'inspector' ? '#10b981' : '#111118', color: viewMode === 'inspector' ? '#fff' : '#5a6675', border: '1px solid #1e1e2e', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '11px'}}
+                >
+                  CLIP INSPECTOR
+                </button>
+              </div>
+              <button 
+                onClick={() => setViewMode('timeline')}
+                style={{width: '100%', padding: '6px', background: viewMode === 'timeline' ? '#10b981' : '#111118', color: viewMode === 'timeline' ? '#fff' : '#5a6675', border: '1px solid #1e1e2e', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '11px'}}
+              >
+                PLAYER TIMELINE (SOCCERNET)
+              </button>
+            </div>
+
+            <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
+              <label style={{fontSize: '10px', color: '#5a6675', letterSpacing: '0.1em'}}>{viewMode === 'timeline' ? 'SOCCERNET MATCH' : 'BROADCAST MATCH'}</label>
+              {viewMode === 'timeline' ? (
+                <select value={soccerNetMatch} onChange={e => { setSoccerNetMatch(e.target.value); setSoccerNetTrack(Object.keys(SOCCERNET_DATA[e.target.value])[0]); }} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '6px', borderRadius: '4px', fontSize: '14px', width: '100%', outline: 'none'}}>
+                  {Object.keys(SOCCERNET_DATA).map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              ) : (
+                <select value={selectedMatch} onChange={e => setSelectedMatch(e.target.value)} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '6px', borderRadius: '4px', fontSize: '14px', width: '100%', outline: 'none'}}>
+                  <option value="match_001">2017 El Clásico (Match 001)</option>
+                </select>
+              )}
+            </div>
+
+            {viewMode === 'timeline' && SOCCERNET_DATA[soccerNetMatch] ? (
+              <div className="player-card" style={{marginTop: '0px'}}>
+                <div className="player-head">
+                  <div className="player-meta" style={{width: '100%'}}>
+                    <label style={{fontSize: '10px', color: '#5a6675', letterSpacing: '0.1em'}}>PLAYER TRACK</label>
+                    <select value={soccerNetTrack} onChange={e => setSoccerNetTrack(e.target.value)} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '6px', borderRadius: '4px', fontSize: '14px', fontWeight: 'bold', width: '100%', outline: 'none', marginTop: '4px'}}>
+                      {Object.entries(SOCCERNET_DATA[soccerNetMatch]).map(([t, data]) => <option key={t} value={t}>Track {data.track_id} ({data.duration_mins} mins)</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div style={{marginTop: '20px', fontSize: '12px', color: '#94a3b8', lineHeight: '1.5', padding: '8px', border: '1px solid #eab30833', background: '#eab30811', borderRadius: '4px'}}>
+                   <span style={{color: '#eab308', fontWeight: 'bold'}}>DATA: SoccerNet (research-only)</span><br/>
+                   This view leverages ground-truth MOT tracking data for full match temporal analysis.
+                </div>
+              </div>
+            ) : viewMode === 'inspector' ? (
+              <div className="player-card" style={{marginTop: '0px'}}>
+                <div className="player-head">
+                  <div className="player-meta" style={{width: '100%'}}>
+                    <label style={{fontSize: '10px', color: '#5a6675', letterSpacing: '0.1em'}}>CLIP / TRACK ID</label>
+                    <select value={selectedPlayer} onChange={e => setSelectedPlayer(e.target.value)} style={{background: '#111118', color: '#34d399', border: '1px solid #1e1e2e', padding: '6px', borderRadius: '4px', fontSize: '14px', fontWeight: 'bold', width: '100%', outline: 'none', marginTop: '4px'}}>
+                      {Object.keys(REAL_MULTI_DATA).map(k => <option key={k} value={k}>{REAL_MULTI_DATA[k].name}</option>)}
+                    </select>
+                    <div className="player-tags" style={{marginTop: '12px'}}>
+                      <span className="tag solid">{pData.profile.pos}</span>
+                      <span className="tag">{pData.profile.age} yrs</span>
+                      <span className="tag">{pData.profile.height} cm</span>
+                      <span className="tag">{pData.profile.weight} kg</span>
+                    </div>
+                  </div>
+                </div>
+
+
+
+                <div className="player-stats">
+                  <div className="kv"><span className="kv-k">DURATION</span><span className="kv-v">{REAL_STATS.matchMinute} min</span></div>
+                  <div className="kv"><span className="kv-k">FRAMES</span><span className="kv-v">{REAL_STATS.dataPoints}</span></div>
+                </div>
+              </div>
+            ) : (
+              <div className="player-card" style={{marginTop: '0px'}}>
+                 <div className="player-stats" style={{gridTemplateColumns: '1fr', gap: '16px'}}>
+                    <div className="kv"><span className="kv-k">TOTAL MATCHES</span><span className="kv-v" style={{fontSize: '24px'}}>1</span></div>
+                    <div className="kv"><span className="kv-k">TOTAL CLIPS</span><span className="kv-v" style={{fontSize: '24px'}}>10</span></div>
+                    <div className="kv"><span className="kv-k">BUCKET SIZE</span><span className="kv-v" style={{fontSize: '24px'}}>15 MIN</span></div>
+                 </div>
+                 <div style={{marginTop: '20px', fontSize: '12px', color: '#98a4b3', lineHeight: '1.5'}}>
+                   <b>HYPOTHESIS:</b> Do gait asymmetry distributions in late-match buckets differ significantly from early-match buckets when aggregated across clips?
+                 </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* MAIN CHART */}
+        <div className="cell-chart panel">
+          <div className="panel-h">
+            <h3>{viewMode === 'timeline' ? 'PLAYER TIMELINE ANALYSIS (SOCCERNET)' : viewMode === 'summary' ? 'GAIT METRIC DISTRIBUTION BY MATCH-MINUTE BUCKET' : 'TEMPORAL RISK CURVE · GAIT DEGRADATION vs MATCH MINUTE'}</h3>
+            <span className="h-meta">{viewMode === 'summary' ? 'AGGREGATE STATISTICS' : 'MOTIONBERT · TCN→XFMR'}</span>
+          </div>
+          <div className="panel-b flush">
+            {viewMode === 'timeline' ? (
+                <SoccerNetTimelineChart playerData={SOCCERNET_DATA[soccerNetMatch]?.[soccerNetTrack]}/>
+            ) : viewMode === 'summary' ? (
+                <BucketDistributionChart aggregateData={AGGREGATE_DATA}/>
+            ) : (
+                <TemporalRiskChart matchMinute={matchMinute} baseline={baseline} live={live} realStats={REAL_STATS}/>
+            )}
+          </div>
+        </div>
+
+        {/* SIDE PANEL */}
+        <div className="cell-side panel" style={{ opacity: viewMode === 'summary' ? 0.3 : 1, pointerEvents: viewMode === 'summary' ? 'none' : 'auto' }}>
+          <div className="panel-h">
+            <h3>POSE ESTIMATION · {viewMode === 'summary' ? 'DISABLED IN SUMMARY' : 'LIVE'}</h3>
+            <span className="h-meta">17 KP · COCO</span>
+          </div>
+          <div className="side">
+            <div className="side-section confidence-block">
+              <div style={{fontSize:10, color:'#98a4b3', textTransform:'uppercase', letterSpacing:'0.14em', marginBottom:6}}>
+                POSE ESTIMATION CONFIDENCE
+              </div>
+              <div className="confidence-num">
+                {confidence.toFixed(3)}<span className="max">/ 1.000</span>
+              </div>
+              <div style={{fontSize:10, color:'#5a6675', marginTop:4, letterSpacing:'0.06em'}}>
+                LOW-CONFIDENCE FRAMES FILTERED · σ &lt; 0.65 DROPPED
+              </div>
+              <div className="confidence-bars">
+                {Array.from({length:32}).map((_,i) => (
+                  <span key={i} className={i < Math.floor(confidence * 32) ? 'on' : 'off'}/>
+                ))}
+              </div>
+            </div>
+
+            <div className="side-section keypoint-vis">
+              <svg className="kp-svg" viewBox="0 0 90 130">
+                {/* skeleton (stick figure) */}
+                <g stroke="#22d3ee" strokeWidth="1" fill="none" opacity="0.85">
+                  <line x1="45" y1="20" x2="45" y2="48"/>
+                  <line x1="32" y1="48" x2="58" y2="48"/>
+                  <line x1="45" y1="48" x2="45" y2="78"/>
+                  <line x1="32" y1="48" x2="22" y2="72"/>
+                  <line x1="22" y1="72" x2="20" y2="92"/>
+                  <line x1="58" y1="48" x2="68" y2="72"/>
+                  <line x1="68" y1="72" x2="70" y2="92"/>
+                  {/* legs */}
+                  <line x1="38" y1="78" x2="34" y2="105" stroke="#10b981"/>
+                  <line x1="34" y1="105" x2="32" y2="124" stroke="#10b981"/>
+                  <line x1="52" y1="78" x2="58" y2="105" stroke="#ef4444"/>
+                  <line x1="58" y1="105" x2="62" y2="124" stroke="#ef4444"/>
+                </g>
+                {/* keypoints */}
+                {[[45,15],[45,20],[32,48],[58,48],[22,72],[68,72],[20,92],[70,92],[38,78],[52,78],[34,105],[58,105],[32,124],[62,124]].map((p,i) => (
+                  <circle key={i} cx={p[0]} cy={p[1]} r="1.6" fill="#22d3ee"/>
+                ))}
+                {/* highlight critical joint */}
+                <circle cx="58" cy="105" r="4" fill="none" stroke="#ef4444" strokeWidth="1">
+                  <animate attributeName="r" values="3;6;3" dur="1.6s" repeatCount="indefinite"/>
+                  <animate attributeName="opacity" values="1;0.2;1" dur="1.6s" repeatCount="indefinite"/>
+                </circle>
+              </svg>
+              <div className="kp-meta">
+                <div className="kp-row"><span>L KNEE</span><b>{REAL_STATS.lKnee}°</b></div>
+                <div className="kp-row"><span>R KNEE</span><b className="crit">{REAL_STATS.rKnee}°</b></div>
+                <div className="kp-row"><span>L HIP</span><b>{REAL_STATS.lHip}°</b></div>
+                <div className="kp-row"><span>R HIP</span><b className="warn">{REAL_STATS.rHip}°</b></div>
+                <div className="kp-row"><span>STRIDE W</span><b>{(REAL_STATS.strideW/100).toFixed(2)}m</b></div>
+                <div className="kp-row"><span>TORSO</span><b className="warn">+4.2°</b></div>
+              </div>
+            </div>
+
+
+          </div>
+        </div>
+
+        {/* MODEL EFFICIENCY */}
+        <div className="cell-model panel">
+          <div className="panel-h">
+            <h3>PIPELINE STRENGTH · CV INFERENCE</h3>
+            <span className="h-meta">YOLO11m · MPS</span>
+          </div>
+          <div className="panel-b">
+            <div className="model-grid">
+              <div className="metric">
+                <span className="metric-k">INFERENCE LATENCY</span>
+                <span className="metric-v cyan">{latency}<span className="unit">ms · p99</span></span>
+              </div>
+              <div className="metric">
+                <span className="metric-k">HARDWARE THROUGHPUT</span>
+                <span className="metric-v">{fps}<span className="unit">frames / batch</span></span>
+              </div>
+              <div className="metric">
+                <span className="metric-k">GPU UTIL</span>
+                <span className="metric-v emerald">87<span className="unit">%</span></span>
+              </div>
+              <div className="metric">
+                <span className="metric-k">VRAM</span>
+                <span className="metric-v">14.2<span className="unit">/ 24 GB</span></span>
+              </div>
+
+              <div className="bar-row">
+                <div className="bar-label">
+                  <span>TEMPORAL SMOOTHING · SAVITZKY-GOLAY (W=11)</span>
+                  <span style={{color:'#10b981'}}>ACTIVE</span>
+                </div>
+                <div className="bar-track">
+                  <div className="bar-fill emerald" style={{ '--w': '92%' }}/>
+                  <div className="bar-segments">
+                    {Array.from({length:11}).map((_,i)=>(<span key={i}/>))}
+                  </div>
+                </div>
+              </div>
+              <div className="bar-row">
+                <div className="bar-label">
+                  <span>OCCLUSION COVERAGE · BoT-SORT</span>
+                  <span style={{color:'#22d3ee'}}>96.3%</span>
+                </div>
+                <div className="bar-track">
+                  <div className="bar-fill" style={{ '--w': '96%' }}/>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* TELEMETRY */}
+        <div className="cell-tele panel" style={{ opacity: viewMode === 'summary' ? 0.3 : 1, pointerEvents: viewMode === 'summary' ? 'none' : 'auto' }}>
+          <div className="panel-h">
+            <h3>BIOMECHANICAL TELEMETRY · {viewMode === 'summary' ? 'DISABLED IN SUMMARY' : 'CLIP ROLLING'}</h3>
+            <span className="h-meta">ALL METRICS · PERSONAL BASELINE NORMALIZED</span>
+          </div>
+          <div className="panel-b flush">
+            <div className="tele-grid">
+              <TeleCard
+                name="KNEE ASYMMETRY"
+                sub="Δ |L–R| / mean · norm"
+                value={REAL_STATS.kneeAsym}
+                unit="rad"
+                status="crit"
+                trend={REAL_STATS.kneeChange}
+                spark={sparkKnee}
+                baseline="0.094"
+                threshold={70}
+              />
+              <TeleCard
+                name="HIP DROP ANGLE"
+                sub="contralateral pelvic dip"
+                value={Math.abs(REAL_STATS.lHip - REAL_STATS.rHip).toFixed(1)}
+                unit="°"
+                status="warn"
+                trend={REAL_STATS.hipChange}
+                spark={sparkHip}
+                baseline="4.1°"
+              />
+              <TeleCard
+                name="VALGUS LOAD PROXY"
+                sub="lateral knee deviation · proxy GRF"
+                value={REAL_STATS.valgusAsym}
+                unit="N·m/kg"
+                status="crit"
+                trend={22.1}
+                spark={sparkValgus}
+                baseline="1.78"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* STATUS BAR */}
+      <div className="statusbar">
+        <div className="statusbar-left">
+          <span><span className="dot" style={{display:'inline-block', marginRight:6}}/>STREAM HEALTHY</span>
+          <span>FRAME <b>30,989</b></span>
+          <span>DROPPED <b>0.04%</b></span>
+          <span>{viewMode === 'summary' ? 'TRACK ID MULTIPLE (10)' : <>TRACK ID <b>#{pData.trackId}</b></>}</span>
+        </div>
+        <div className="statusbar-right">
+          <span>MODEL <b>YOLO11m-pose · Apple MPS</b></span>
+          <span>TFC PRETRAIN <b>v0.7</b></span>
+          <span>TACTICAL FiLM <b>4-2-3-1</b></span>
+          <span>BUILD <b>2026.05.08</b></span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
